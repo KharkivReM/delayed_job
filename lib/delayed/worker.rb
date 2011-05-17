@@ -7,17 +7,20 @@ require 'logger'
 
 module Delayed
   class Worker
-    cattr_accessor :min_priority, :max_priority, :max_attempts, :max_run_time, :default_priority, :sleep_delay, :logger, :delay_jobs
+    cattr_accessor :min_priority, :max_priority, :max_attempts, :max_run_time, :default_priority, :sleep_delay, :logger, :delay_jobs, :max_retries
     self.sleep_delay = 5
     self.max_attempts = 25
     self.max_run_time = 4.hours
     self.default_priority = 0
     self.delay_jobs = true
+    self.max_retries = 5
 
     # By default failed jobs are destroyed after too many attempts. If you want to keep them around
     # (perhaps to inspect the reason for the failure), set this to false.
     cattr_accessor :destroy_failed_jobs
-    self.destroy_failed_jobs = true
+    cattr_accessor :destroy_successful_jobs
+    self.destroy_failed_jobs = false
+    self.destroy_successful_jobs = false
 
     self.logger = if defined?(Rails)
       Rails.logger
@@ -71,27 +74,39 @@ module Delayed
 
       trap('TERM') { say 'Exiting...'; $exit = true }
       trap('INT')  { say 'Exiting...'; $exit = true }
+      tries = 0
 
-      loop do
-        result = nil
+      begin
+        tries += 1
+        loop do
+          result = nil
 
-        realtime = Benchmark.realtime do
-          result = work_off
+          realtime = Benchmark.realtime do
+            result = work_off
+          end
+
+          count = result.sum
+
+          break if $exit
+
+          if count.zero?
+            sleep(self.class.sleep_delay)
+          else
+            say "#{count} jobs processed at %.4f j/s, %d failed ..." % [count / realtime, result.last]
+          end
+
+          break if $exit
         end
 
-        count = result.sum
-
-        break if $exit
-
-        if count.zero?
-          sleep(self.class.sleep_delay)
+      rescue ActiveRecord::StatementInvalid => e
+        if tries < self.max_retries && e.message =~ /PGError: no connection to the server/
+          logger.error("lost connection to database, trying to re-establish connection. Try(#{tries}/5")
+          ActiveRecord::Base.establish_connection
+          retry 
         else
-          say "#{count} jobs processed at %.4f j/s, %d failed ..." % [count / realtime, result.last]
+          raise e
         end
-
-        break if $exit
       end
-
     ensure
       Delayed::Job.clear_locks!(name)
     end
@@ -119,7 +134,7 @@ module Delayed
     def run(job)
       runtime =  Benchmark.realtime do
         Timeout.timeout(self.class.max_run_time.to_i) { job.invoke_job }
-        job.destroy
+        job.destroy if destroy_successful_jobs 
       end
       say "#{job.name} completed after %.4f" % runtime
       return true  # did work
@@ -134,6 +149,8 @@ module Delayed
     # Reschedule the job in the future (when a job fails).
     # Uses an exponential scale depending on the number of failed attempts.
     def reschedule(job, time = nil)
+      # Rustam: need to reload job to get most recent status
+      job.reload
       if (job.attempts += 1) < max_attempts(job)
         time ||= job.reschedule_at
         job.run_at = time
